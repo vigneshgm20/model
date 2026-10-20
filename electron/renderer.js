@@ -767,8 +767,15 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
     /* ============ ANSWER ============ */
-    async function handleAnswerButton() {
-        if (!currentTranscript.trim()) { showInAppAlert("Please speak or type a question first"); return; }
+       async function handleAnswerButton() {
+        if (!isSessionActive || !currentSessionId) {
+            showInAppAlert("Start or reopen a session first");
+            return;
+        }
+        if (!currentTranscript.trim()) {
+            showInAppAlert("Please speak or type a question first");
+            return;
+        }
         if (isAiResponding) return;
 
         const q = currentTranscript.trim();
@@ -785,50 +792,68 @@ document.addEventListener("DOMContentLoaded", function () {
             const r = await fetch("http://127.0.0.1:8000/api/answer-stream-fast", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: q })
+                body: JSON.stringify({
+                    text: q,
+                    session_id: currentSessionId,
+                    request_id: (crypto.randomUUID
+                        ? crypto.randomUUID()
+                        : String(Date.now()) + Math.random())
+                })
             });
+
+            if (!r.ok || !r.body) {
+                throw new Error(`Answer request failed: HTTP ${r.status}`);
+            }
+
             const reader = r.body.getReader();
             const decoder = new TextDecoder();
             let buf = "", acc = "";
             let firstTokenLogged = false;
             const t0 = performance.now();
 
+            const handleLine = (line) => {
+                if (!line.startsWith('data: ')) return;
+                try {
+                    const d = JSON.parse(line.slice(6));
+                    if (d.type === 'ai_stream') {
+                        if (!firstTokenLogged) {
+                            console.log(`⚡ First token in ${(performance.now()-t0).toFixed(0)}ms`);
+                            firstTokenLogged = true;
+                        }
+                        acc += d.content || "";
+                        if (acc.length > 0 && !qaAnswer.querySelector('.paragraph, .bullet-item, .chatgpt-code-block')) {
+                            qaAnswer.innerHTML = '';
+                        }
+                        renderStreamingAnswer(qaAnswer, acc);
+                    } else if (d.type === 'ai_complete') {
+                        renderAnswer(qaAnswer, acc, { bulletMode: currentBulletMode });
+                        console.log(`✅ Complete in ${(performance.now()-t0).toFixed(0)}ms`);
+                        pushToQaHistory(q, acc, currentBulletMode);
+                        setTimeout(() => {
+                            qaQuestion.textContent = "Listening for next question...";
+                        }, 500);
+                    } else if (d.type === 'ai_error') {
+                        qaAnswer.innerHTML = `<div class="error">Error: ${escapeHtml(d.error || 'unknown')}</div>`;
+                    }
+                } catch (_) {}
+            };
+
             while (true) {
                 const { value, done } = await reader.read();
                 if (done) break;
                 buf += decoder.decode(value, { stream: true });
-                const lines = buf.split('\n\n');
-                buf = lines.pop() || "";
-                for (const line of lines) {
-                    if (!line.startsWith('data: ')) continue;
-                    try {
-                        const d = JSON.parse(line.slice(6));
-                        if (d.type === 'ai_stream') {
-                            if (!firstTokenLogged) {
-                                console.log(`⚡ First token in ${(performance.now()-t0).toFixed(0)}ms`);
-                                firstTokenLogged = true;
-                            }
-                            acc += d.content || "";
-                            if (acc.length > 0 && !qaAnswer.querySelector('.paragraph, .bullet-item, .chatgpt-code-block')) {
-                                qaAnswer.innerHTML = '';
-                            }
-                            renderStreamingAnswer(qaAnswer, acc);
-                        } else if (d.type === 'ai_complete') {
-                            // Always re-render from raw so stream HTML == final HTML.
-                            renderAnswer(qaAnswer, acc, { bulletMode: currentBulletMode });
-                            console.log(`✅ Complete in ${(performance.now()-t0).toFixed(0)}ms`);
-                            pushToQaHistory(q, acc, currentBulletMode);
-                            setTimeout(() => {
-                                qaQuestion.textContent = "Listening for next question...";
-                            }, 500);
-                        } else if (d.type === 'ai_error') {
-                            qaAnswer.innerHTML = `<div class="error">Error: ${escapeHtml(d.error || 'unknown')}</div>`;
-                        }
-                    } catch (_) {}
-                }
+                const events = buf.split('\n\n');
+                buf = events.pop() || "";
+                for (const ev of events) handleLine(ev.trim());
             }
+
+            // Flush any trailing event left in buf when the stream ends.
+            buf += decoder.decode();
+            const tail = buf.trim();
+            if (tail.startsWith('data: ')) handleLine(tail);
+
         } catch (e) {
-            qaAnswer.innerHTML = `<div class="error">Error: ${e.message}</div>`;
+            qaAnswer.innerHTML = `<div class="error">Error: ${escapeHtml(e.message)}</div>`;
         } finally {
             isAiResponding = false;
             if (btnAnswer) btnAnswer.disabled = false;
@@ -975,32 +1000,39 @@ document.addEventListener("DOMContentLoaded", function () {
         } catch (_) { setTimeout(connectSSE, 1000); }
     }
 
-    function handleTranscript(data) {
+       function handleTranscript(data) {
         const text = data.text?.trim();
         if (!text) return;
-        const now = Date.now();
-        if (text === lastProcessedText && (now - lastProcessedTime) < 300) return;
-        lastProcessedText = text;
-        lastProcessedTime = now;
 
         if (data.source === "mic" && micMuted) return;
         if (data.source === "system" && systemMuted) return;
+
+        const now = Date.now();
 
         if (data.source === "system") {
             liveInterviewerText = text;
             liveInterviewerTimestamp = now;
         }
 
-        if (data.is_final) {
-            lastPartialText = "";
-            currentTranscript = text;
-            qaQuestion.textContent = currentTranscript;
-            qaQuestion.classList.remove("partial-text");
-        } else if (data.is_partial) {
+        // Partial speech: preview only — never submit it as the question.
+        if (data.is_partial || data.is_final === false) {
             lastPartialText = text;
             qaQuestion.textContent = text;
             qaQuestion.classList.add("partial-text");
+            return;
         }
+
+        if (!data.is_final) return;
+
+        // Dedup final transcripts within a very short window.
+        if (text === lastProcessedText && (now - lastProcessedTime) < 300) return;
+        lastProcessedText = text;
+        lastProcessedTime = now;
+
+        lastPartialText = "";
+        currentTranscript = text;
+        qaQuestion.textContent = currentTranscript;
+        qaQuestion.classList.remove("partial-text");
     }
 
     /* ============ STEPS / TABS ============ */
